@@ -1,0 +1,130 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2019-x64",
+      "displayName": "Visual Studio 2019 - x64",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "SRPC_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
+      "name": "vs2019-x86",
+      "displayName": "Visual Studio 2019 - x86",
+      "generator": "Visual Studio 16 2019",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "SRPC_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
+      "name": "vs2022-x64",
+      "displayName": "Visual Studio 2022 - x64",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "SRPC_BUILD_EXAMPLES": "ON"
+      }
+    },
+    {
+      "name": "vs2022-x86",
+      "displayName": "Visual Studio 2022 - x86",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "SRPC_BUILD_EXAMPLES": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2019-x64-debug",
+      "configurePreset": "vs2019-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2019-x64-release",
+      "configurePreset": "vs2019-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "vs2019-x86-debug",
+      "configurePreset": "vs2019-x86",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2019-x86-release",
+      "configurePreset": "vs2019-x86",
+      "configuration": "Release"
+    },
+    {
+      "name": "x64-debug",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Debug"
+    },
+    {
+      "name": "x64-release",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Release"
+    },
+    {
+      "name": "x86-debug",
+      "configurePreset": "vs2022-x86",
+      "configuration": "Debug"
+    },
+    {
+      "name": "x86-release",
+      "configurePreset": "vs2022-x86",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "vs2019-x64-debug",
+      "configurePreset": "vs2019-x64",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "vs2019-x86-debug",
+      "configurePreset": "vs2019-x86",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "x64-debug",
+      "configurePreset": "vs2022-x64",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "x86-debug",
+      "configurePreset": "vs2022-x86",
+      "configuration": "Debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

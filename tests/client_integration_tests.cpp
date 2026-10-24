@@ -1,0 +1,1693 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <srpc/client.hpp>
+#include <srpc/discovery.hpp>
+
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+namespace fs = std::filesystem;
+
+void require(bool condition, std::string_view message) {
+    if (!condition) {
+        throw std::runtime_error(std::string(message));
+    }
+}
+
+class TemporaryDirectory final {
+public:
+    TemporaryDirectory() {
+        const auto suffix = std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        path_ = fs::temp_directory_path() / ("srpc-client-tests-" + suffix);
+        if (!fs::create_directory(path_)) {
+            throw std::runtime_error("Could not create the transfer-test directory");
+        }
+    }
+
+    ~TemporaryDirectory() {
+        std::error_code ignored;
+        static_cast<void>(fs::remove_all(path_, ignored));
+    }
+
+    TemporaryDirectory(const TemporaryDirectory&) = delete;
+    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+    [[nodiscard]] const fs::path& path() const noexcept {
+        return path_;
+    }
+
+private:
+    fs::path path_;
+};
+
+void write_local_file(const fs::path& path, std::span<const std::uint8_t> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    if (!output) {
+        throw std::runtime_error("Could not write a local transfer-test file");
+    }
+}
+
+srpc::ByteBuffer read_local_file(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    return srpc::ByteBuffer(
+        std::istreambuf_iterator<char>(input),
+        std::istreambuf_iterator<char>());
+}
+
+void socket_send(SOCKET socket, const std::uint8_t* data, std::size_t size) {
+    std::size_t sent = 0;
+    while (sent < size) {
+        const int result = send(
+            socket,
+            reinterpret_cast<const char*>(data + sent),
+            static_cast<int>(size - sent),
+            0);
+        if (result <= 0) {
+            throw std::runtime_error("Fake XBDM server failed to send data");
+        }
+        sent += static_cast<std::size_t>(result);
+    }
+}
+
+void socket_send(SOCKET socket, std::string_view text) {
+    socket_send(
+        socket,
+        reinterpret_cast<const std::uint8_t*>(text.data()),
+        text.size());
+}
+
+srpc::ByteBuffer socket_read_exact(SOCKET socket, std::size_t size) {
+    srpc::ByteBuffer result(size);
+    std::size_t received = 0;
+    while (received < size) {
+        const int count = recv(
+            socket,
+            reinterpret_cast<char*>(result.data() + received),
+            static_cast<int>(size - received),
+            0);
+        if (count <= 0) {
+            throw std::runtime_error(
+                "Fake XBDM server connection closed during binary transfer");
+        }
+        received += static_cast<std::size_t>(count);
+    }
+    return result;
+}
+
+// Frames `data` the way XBDM frames a getmemex body: a little-endian uint16
+// per block giving the byte count, with bit 15 set on the last one. The old
+// helper sent the payload flat, which is why it agreed with a client that read
+// it flat and neither of them matched the console. Blocks are 0x400 bytes.
+std::vector<std::uint8_t> frame_getmemex_body(
+    std::span<const std::uint8_t> data,
+    bool complete = true) {
+    constexpr std::size_t block_size = 0x400;
+    std::vector<std::uint8_t> out;
+    std::size_t offset = 0;
+    do {
+        const auto count = std::min(block_size, data.size() - offset);
+        const bool last = complete && offset + count >= data.size();
+        const auto header = static_cast<std::uint16_t>(count | (last ? 0x8000u : 0u));
+        out.push_back(static_cast<std::uint8_t>(header & 0xFF));
+        out.push_back(static_cast<std::uint8_t>(header >> 8));
+        out.insert(
+            out.end(),
+            data.begin() + static_cast<std::ptrdiff_t>(offset),
+            data.begin() + static_cast<std::ptrdiff_t>(offset + count));
+        offset += count;
+    } while (offset < data.size());
+    return out;
+}
+
+// A body that stops early because the console reached unmapped memory: the
+// blocks that were readable, then a zero-length block carrying the end flag.
+std::vector<std::uint8_t> frame_getmemex_hole(std::span<const std::uint8_t> readable) {
+    auto out = frame_getmemex_body(readable, false);
+    out.push_back(0x00);
+    out.push_back(0x80);
+    return out;
+}
+
+void socket_send_binary_response(
+    SOCKET socket,
+    std::span<const std::uint8_t> data) {
+    socket_send(socket, "203- binary response follows\r\n");
+    const auto framed = frame_getmemex_body(data);
+    socket_send(socket, framed.data(), framed.size());
+}
+
+std::string socket_read_line(SOCKET socket) {
+    std::string line;
+    for (;;) {
+        char value = 0;
+        const int result = recv(socket, &value, 1, 0);
+        if (result <= 0) {
+            throw std::runtime_error("Fake XBDM server connection closed unexpectedly");
+        }
+        if (value == '\n') {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            return line;
+        }
+        line.push_back(value);
+        if (line.size() > 4096) {
+            throw std::runtime_error("Fake XBDM server received an oversized line");
+        }
+    }
+}
+
+void expect_line(SOCKET socket, std::string_view expected) {
+    const auto actual = socket_read_line(socket);
+    if (actual != expected) {
+        throw std::runtime_error(
+            "Unexpected command. Expected '" + std::string(expected) +
+            "', received '" + actual + "'");
+    }
+}
+
+std::string hex_lower(std::span<const std::uint8_t> bytes) {
+    constexpr char digits[] = "0123456789abcdef";
+    std::string result(bytes.size() * 2, '0');
+    for (std::size_t index = 0; index < bytes.size(); ++index) {
+        result[index * 2] = digits[bytes[index] >> 4];
+        result[index * 2 + 1] = digits[bytes[index] & 0x0F];
+    }
+    return result;
+}
+
+class ScriptedServer final {
+public:
+    using Script = std::function<void(SOCKET)>;
+
+    explicit ScriptedServer(Script script) {
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            throw std::runtime_error("Fake XBDM server could not start Winsock");
+        }
+        winsock_started_ = true;
+
+        listener_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listener_ == INVALID_SOCKET) {
+            throw std::runtime_error("Fake XBDM server could not create a socket");
+        }
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(
+                listener_,
+                reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address)) == SOCKET_ERROR ||
+            listen(listener_, 1) == SOCKET_ERROR) {
+            throw std::runtime_error("Fake XBDM server could not bind its socket");
+        }
+
+        int address_size = sizeof(address);
+        if (getsockname(
+                listener_,
+                reinterpret_cast<sockaddr*>(&address),
+                &address_size) == SOCKET_ERROR) {
+            throw std::runtime_error("Fake XBDM server could not read its port");
+        }
+        port_ = ntohs(address.sin_port);
+
+        thread_ = std::thread([this, script = std::move(script)] {
+            SOCKET client = accept(listener_, nullptr, nullptr);
+            if (client == INVALID_SOCKET) {
+                error_ = std::make_exception_ptr(
+                    std::runtime_error("Fake XBDM server could not accept a client"));
+                return;
+            }
+            try {
+                script(client);
+            } catch (...) {
+                error_ = std::current_exception();
+            }
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+        });
+    }
+
+    ~ScriptedServer() {
+        if (listener_ != INVALID_SOCKET) {
+            closesocket(listener_);
+            listener_ = INVALID_SOCKET;
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (winsock_started_) {
+            WSACleanup();
+        }
+    }
+
+    ScriptedServer(const ScriptedServer&) = delete;
+    ScriptedServer& operator=(const ScriptedServer&) = delete;
+
+    [[nodiscard]] std::uint16_t port() const noexcept {
+        return port_;
+    }
+
+    void finish() {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+        if (error_) {
+            std::rethrow_exception(error_);
+        }
+    }
+
+private:
+    bool winsock_started_ = false;
+    SOCKET listener_ = INVALID_SOCKET;
+    std::uint16_t port_ = 0;
+    std::thread thread_;
+    std::exception_ptr error_;
+};
+
+srpc::ClientOptions test_options(
+    std::uint16_t port,
+    srpc::Protocol protocol = srpc::Protocol::automatic) {
+    srpc::ClientOptions options;
+    options.protocol = protocol;
+    options.port = port;
+    options.connect_timeout = std::chrono::milliseconds(1000);
+    options.io_timeout = std::chrono::milliseconds(1000);
+    options.rpc_timeout = std::chrono::milliseconds(500);
+    options.poll_interval = std::chrono::milliseconds(1);
+    return options;
+}
+
+static_assert(
+    static_cast<std::uint32_t>(srpc::NotificationType::console_message) == 34);
+static_assert(
+    static_cast<std::uint32_t>(srpc::NotificationType::smartglass_available) == 77);
+
+void integration_test() {
+    const srpc::ByteBuffer write_data = [] {
+        srpc::ByteBuffer bytes(130);
+        for (std::size_t index = 0; index < bytes.size(); ++index) {
+            bytes[index] = static_cast<std::uint8_t>(index);
+        }
+        return bytes;
+    }();
+
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- con");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        socket_send(socket, "nected\r\n");
+
+        expect_line(socket, "getpid");
+        socket_send(socket, "200- pid=0x42\r\n");
+
+        expect_line(socket, "dirlist name=\"Hdd:\\\"");
+        socket_send(socket, "202- multiline response follows\r\nname=\"one.xex\"\r\n");
+        socket_send(socket, "name=\"Content\" directory\r\n.\r\n");
+
+        expect_line(socket, "getmemex addr=0x82000000 length=4");
+        const std::array<std::uint8_t, 4> read_bytes{0xDE, 0xAD, 0xBE, 0xEF};
+        socket_send_binary_response(socket, read_bytes);
+
+        expect_line(
+            socket,
+            "setmem addr=0x82000000 data=" +
+                hex_lower(std::span<const std::uint8_t>(write_data).first(128)));
+        socket_send(socket, "200- OK\r\n");
+        expect_line(
+            socket,
+            "setmem addr=0x82000080 data=" +
+                hex_lower(std::span<const std::uint8_t>(write_data).subspan(128)));
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "s360");
+        socket_send(socket, "407- unknown command\r\n");
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=13 system as=0 "
+            "params=\"A\\0\\A\\0\\\"");
+        socket_send(socket, "200- 17559\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=1 system as=0 "
+            "params=\"A\\82345678\\A\\1\\1\\7\\\"");
+        socket_send(socket, "200- buf_addr=825F0008\r\n");
+        expect_line(socket, "consolefeatures buf_addr=0x825F0008");
+        socket_send(socket, "200- 0000002A\r\n");
+    });
+
+    srpc::ClientOptions options;
+    options.port = server.port();
+    options.connect_timeout = std::chrono::milliseconds(1000);
+    options.io_timeout = std::chrono::milliseconds(1000);
+    options.rpc_timeout = std::chrono::milliseconds(500);
+    options.poll_interval = std::chrono::milliseconds(1);
+
+    {
+        srpc::Client client("127.0.0.1", options);
+        client.connect();
+        const auto pid = client.send_command("getpid");
+        require(pid.message == "pid=0x42", "single-line response was not preserved");
+
+        const auto directory = client.send_multiline_command("dirlist name=\"Hdd:\\\"");
+        require(directory.size() == 2, "multiline response did not contain two rows");
+        require(directory[0] == "name=\"one.xex\"", "first multiline row is wrong");
+
+        require(
+            client.read_memory(0x82000000, 4) ==
+                srpc::ByteBuffer{0xDE, 0xAD, 0xBE, 0xEF},
+            "binary memory response was not read exactly");
+        client.write_memory(0x82000000, write_data);
+
+        require(client.protocol() == srpc::Protocol::jrpc2, "JRPC2 was not detected");
+        require(
+            client.call_uint32(0x82345678, {std::uint32_t{7}}) == 0x2A,
+            "pending JRPC2 result was not polled correctly");
+    }
+
+    server.finish();
+}
+
+void memory_helpers_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "getmemex addr=0x82001000 length=4");
+        const std::array<std::uint8_t, 4> array_bytes{0x11, 0x22, 0x33, 0x44};
+        socket_send_binary_response(socket, array_bytes);
+
+        expect_line(socket, "setmem addr=0x82001010 data=1234abcd");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "getmemex addr=0x82002000 length=2");
+        const std::array<std::uint8_t, 2> chunk_one{0x01, 0x02};
+        socket_send_binary_response(socket, chunk_one);
+        expect_line(socket, "getmemex addr=0x82002002 length=2");
+        const std::array<std::uint8_t, 2> chunk_two{0x03, 0x04};
+        socket_send_binary_response(socket, chunk_two);
+        expect_line(socket, "getmemex addr=0x82002004 length=1");
+        const std::array<std::uint8_t, 1> chunk_three{0x05};
+        socket_send_binary_response(socket, chunk_three);
+
+        expect_line(socket, "getmemex addr=0x82003000 length=8");
+        const std::array<std::uint8_t, 8> cstring_bytes{
+            'H', 'i', 0, 'x', 'y', 'z', 0, 0};
+        socket_send_binary_response(socket, cstring_bytes);
+
+        expect_line(socket, "setmem addr=0x82003010 data=52504300");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "getmemex addr=0x82004000 length=8");
+        const std::array<std::uint8_t, 8> utf16_bytes{
+            0x00, 0x41, 0x03, 0xA9, 0x00, 0x00, 0x12, 0x34};
+        socket_send_binary_response(socket, utf16_bytes);
+
+        expect_line(socket, "setmem addr=0x82004010 data=4100a9030000");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(
+            socket,
+            "setmem addr=0x82005000 data=" + std::string(256, 'a'));
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "setmem addr=0x82005080 data=aaaa");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "setmem addr=0x82005100 data=000000");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "setmem addr=0x82006000 data=48000011");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(
+            socket,
+            "setmem addr=0x82006100 data="
+            "3d601234616b56787d6903a64e800420");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "walkmem");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "base=0x83000000 size=0x00001000 protect=0x00000004\r\n"
+            "ignored=1\r\n"
+            "size=00002000 base=82000000 protect=00000020\r\n"
+            ".\r\n");
+
+        expect_line(socket, "getmemex addr=0x82000000 length=1");
+        const std::array<std::uint8_t, 1> valid_byte{0x7F};
+        socket_send_binary_response(socket, valid_byte);
+        expect_line(socket, "getmemex addr=0xDEADBEEF length=1");
+        socket_send(socket, "404- memory not mapped\r\n");
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        const auto array_values = client.read_array<std::uint16_t>(
+            0x82001000, 2, srpc::Endian::big);
+        require(
+            array_values == std::vector<std::uint16_t>{0x1122, 0x3344},
+            "array reads did not reverse each big-endian element independently");
+
+        const std::array<std::uint16_t, 2> write_values{0x1234, 0xABCD};
+        client.write_array<std::uint16_t>(
+            0x82001010,
+            std::span<const std::uint16_t>(write_values),
+            srpc::Endian::big);
+
+        require(
+            client.read_memory_chunked(0x82002000, 5, 2) ==
+                srpc::ByteBuffer{0x01, 0x02, 0x03, 0x04, 0x05},
+            "chunked memory reads were not joined in address order");
+        require(
+            client.read_cstring(0x82003000, 8) == "Hi",
+            "C string read did not stop at its first terminator");
+        client.write_cstring(0x82003010, "RPC");
+
+        require(
+            client.read_utf16_string(0x82004000, 4, srpc::Endian::big) ==
+                u"A\u03A9",
+            "UTF-16 read did not preserve big-endian code-unit order");
+        client.write_utf16_string(
+            0x82004010, u"A\u03A9", srpc::Endian::little);
+
+        client.fill_memory(0x82005000, 130, 0xAA);
+        client.zero_memory(0x82005100, 3);
+        client.write_branch(0x82006000, 0x82006010, true);
+        client.write_jump(0x82006100, 0x12345678);
+
+        const auto regions = client.memory_regions();
+        require(regions.size() == 2, "walkmem did not return two usable regions");
+        require(
+            regions[0].base == 0x82000000 &&
+                regions[0].size == 0x2000 &&
+                regions[0].protection == 0x20,
+            "walkmem did not parse or sort the first memory region");
+        require(
+            regions[1].base == 0x83000000 &&
+                regions[1].size == 0x1000 &&
+                regions[1].protection == 0x04,
+            "walkmem did not parse the second memory region");
+        require(
+            client.is_valid_address(0x82000000),
+            "mapped address was reported as invalid");
+        require(
+            !client.is_valid_address(0xDEADBEEF),
+            "XBDM 404 address was not reported as invalid");
+    }
+
+    server.finish();
+}
+
+void pointer_chain_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        // read_pointer walks the chain and then reads the value at its end.
+        // Each offset is added after the dereference, so the last one only
+        // shifts the final address.
+        const std::array<std::uint8_t, 4> first_link{0x83, 0x00, 0x00, 0x00};
+        const std::array<std::uint8_t, 4> second_link{0x84, 0x00, 0x00, 0x00};
+        const std::array<std::uint8_t, 4> target_value{0x00, 0x00, 0xBE, 0xEF};
+        expect_line(socket, "getmemex addr=0x82001000 length=4");
+        socket_send_binary_response(socket, first_link);
+        expect_line(socket, "getmemex addr=0x83000010 length=4");
+        socket_send_binary_response(socket, second_link);
+        expect_line(socket, "getmemex addr=0x83FFFFF8 length=4");
+        socket_send_binary_response(socket, target_value);
+
+        // write_pointer repeats the walk and writes at the resolved address.
+        expect_line(socket, "getmemex addr=0x82001000 length=4");
+        socket_send_binary_response(socket, first_link);
+        expect_line(socket, "getmemex addr=0x83000010 length=4");
+        socket_send_binary_response(socket, second_link);
+        expect_line(socket, "setmem addr=0x83FFFFF8 data=3f800000");
+        socket_send(socket, "200- OK\r\n");
+
+        const std::array<std::uint8_t, 4> span_link{0x82, 0x0A, 0x00, 0x00};
+        expect_line(socket, "getmemex addr=0x82002000 length=4");
+        socket_send_binary_response(socket, span_link);
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        require(
+            client.read_pointer<std::uint32_t>(0x82001000, {0x10, -0x8}) ==
+                0x0000BEEF,
+            "pointer chain read did not return the value at the resolved address");
+        client.write_pointer<float>(0x82001000, 1.0F, {0x10, -0x8});
+
+        const std::array<std::int32_t, 1> offsets{0x24};
+        require(
+            client.resolve_pointer(0x82002000, offsets) == 0x820A0024,
+            "a span of offsets did not resolve the same way as a braced list");
+        require(
+            client.resolve_pointer(0x82003000, {}) == 0x82003000,
+            "an empty offset list should resolve to the address itself");
+    }
+
+    server.finish();
+}
+
+void sparse_memory_read_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "getmemex addr=0x82010002 length=2");
+        const std::array<std::uint8_t, 2> first_chunk{0xA1, 0xA2};
+        socket_send_binary_response(socket, first_chunk);
+        expect_line(socket, "getmemex addr=0x82010004 length=1");
+        const std::array<std::uint8_t, 1> second_chunk{0xA3};
+        socket_send_binary_response(socket, second_chunk);
+        expect_line(socket, "getmemex addr=0x82010008 length=2");
+        const std::array<std::uint8_t, 2> third_chunk{0xB1, 0xB2};
+        socket_send_binary_response(socket, third_chunk);
+        expect_line(socket, "getmemex addr=0x8201000A length=2");
+        const std::array<std::uint8_t, 2> fourth_chunk{0xB3, 0xB4};
+        socket_send_binary_response(socket, fourth_chunk);
+
+        expect_line(socket, "walkmem");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "base=0x82011005 size=0x3 protect=0x4\r\n"
+            "base=0x82011001 size=0x2 protect=0x4\r\n"
+            ".\r\n");
+        expect_line(socket, "getmemex addr=0x82011001 length=2");
+        const std::array<std::uint8_t, 2> discovered_first{0xC1, 0xC2};
+        socket_send_binary_response(socket, discovered_first);
+        expect_line(socket, "getmemex addr=0x82011005 length=2");
+        const std::array<std::uint8_t, 2> discovered_second{0xD1, 0xD2};
+        socket_send_binary_response(socket, discovered_second);
+        expect_line(socket, "getmemex addr=0x82011007 length=1");
+        const std::array<std::uint8_t, 1> discovered_third{0xD3};
+        socket_send_binary_response(socket, discovered_third);
+
+        expect_line(socket, "getmemex addr=0x82012000 length=2");
+        socket_send(socket, "404- memory not mapped\r\n");
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        const std::array<srpc::MemoryRegion, 2> supplied_regions{
+            srpc::MemoryRegion{0x82010008, 4, 0x04},
+            srpc::MemoryRegion{0x82010002, 3, 0x04},
+        };
+        std::vector<std::size_t> progress_values;
+        const auto sparse = client.read_memory_sparse(
+            0x82010000,
+            12,
+            std::span<const srpc::MemoryRegion>(supplied_regions),
+            2,
+            [&](std::size_t processed, std::size_t total) {
+                require(total == 12, "sparse progress changed the requested total");
+                progress_values.push_back(processed);
+                return true;
+            });
+        require(
+            sparse == srpc::ByteBuffer{
+                0x00, 0x00, 0xA1, 0xA2, 0xA3, 0x00,
+                0x00, 0x00, 0xB1, 0xB2, 0xB3, 0xB4},
+            "sparse read did not preserve readable bytes and zero only gaps");
+        require(
+            progress_values == std::vector<std::size_t>{0, 2, 4, 5, 7, 8, 10, 12},
+            "sparse progress was not monotonic across reads and gaps");
+
+        require(
+            client.read_memory_sparse(0x82011000, 8, 2) ==
+                srpc::ByteBuffer{0x00, 0xC1, 0xC2, 0x00, 0x00, 0xD1, 0xD2, 0xD3},
+            "walkmem-backed sparse read did not honor discovered boundaries");
+
+        const std::array<srpc::MemoryRegion, 1> failing_region{
+            srpc::MemoryRegion{0x82012000, 2, 0x04},
+        };
+        bool mapped_error_propagated = false;
+        try {
+            static_cast<void>(client.read_memory_sparse(
+                0x82012000,
+                2,
+                std::span<const srpc::MemoryRegion>(failing_region),
+                2));
+        } catch (const srpc::CommandError& error) {
+            mapped_error_propagated = error.status_code() == 404;
+        }
+        require(
+            mapped_error_propagated,
+            "sparse read hid an error inside a declared readable region");
+
+        require(
+            client.read_memory_sparse(
+                0x82013000,
+                4,
+                std::span<const srpc::MemoryRegion>{},
+                2) == srpc::ByteBuffer(4, 0),
+            "an explicitly empty region set did not produce an all-zero buffer");
+
+        bool zero_chunk_rejected = false;
+        try {
+            static_cast<void>(client.read_memory_sparse(
+                0x82010000,
+                0,
+                std::span<const srpc::MemoryRegion>(supplied_regions),
+                0));
+        } catch (const srpc::ProtocolError&) {
+            zero_chunk_rejected = true;
+        }
+        require(zero_chunk_rejected, "sparse read accepted a zero chunk size");
+
+        bool overflow_rejected = false;
+        try {
+            static_cast<void>(client.read_memory_sparse(
+                0xFFFFFFFF,
+                2,
+                std::span<const srpc::MemoryRegion>(supplied_regions),
+                1));
+        } catch (const srpc::ProtocolError&) {
+            overflow_rejected = true;
+        }
+        require(overflow_rejected, "sparse read accepted a wrapped address range");
+
+        bool cancellation_called = false;
+        std::size_t cancellation_position = 1;
+        bool cancellation_reported = false;
+        try {
+            static_cast<void>(client.read_memory_sparse(
+                0x82010000,
+                12,
+                std::span<const srpc::MemoryRegion>(supplied_regions),
+                2,
+                [&](std::size_t processed, std::size_t) {
+                    cancellation_called = true;
+                    cancellation_position = processed;
+                    return false;
+                }));
+        } catch (const srpc::Error&) {
+            cancellation_reported = true;
+        }
+        require(
+            cancellation_called && cancellation_position == 0 && cancellation_reported,
+            "sparse cancellation did not stop before returning partial data");
+    }
+
+    server.finish();
+}
+
+void xbdm_metadata_and_filesystem_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "getconsoleid");
+        socket_send(socket, "200- consoleid=001122334455\r\n");
+
+        expect_line(socket, "consoletype");
+        socket_send(socket, "200- type=TestKit\r\n");
+        expect_line(socket, "consoletype");
+        socket_send(socket, "200- testkit\r\n");
+
+        expect_line(socket, "dmversion");
+        socket_send(socket, "200- 2.0.20353.0\r\n");
+
+        expect_line(socket, "drivelist");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "drivename=\"Hdd:\"\r\n"
+            "ignored=value\r\n"
+            "drivename=\"Usb0:\"\r\n"
+            ".\r\n");
+
+        expect_line(socket, "modules");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "name=\"xam.xex\" base=0x81600000\r\n"
+            "name=\"default.xex\" base=0x82000000\r\n"
+            ".\r\n");
+
+        expect_line(socket, "getpid");
+        socket_send(socket, "200- pid=0x42\r\n");
+
+        expect_line(socket, "xbeinfo name=");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "timestamp=00000000\r\n"
+            "name=\"Hdd:\\Games\\default.xex\"\r\n"
+            ".\r\n");
+
+        expect_line(socket, "dirlist name=\"Hdd:\\Games\"");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "name=\"default.xex\" sizehi=00000001 sizelo=00000002 "
+            "createhi=00000003 createlo=00000004 "
+            "changehi=00000005 changelo=00000006\r\n"
+            "name=\"Content\" directory\r\n"
+            ".\r\n");
+
+        expect_line(socket, "mkdir name=\"Hdd:\\New Folder\"");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "delete name=\"Hdd:\\old.bin\"");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "delete name=\"Hdd:\\Old Folder\" dir");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(
+            socket,
+            "rename name=\"Hdd:\\before.bin\" "
+            "newname=\"Hdd:\\after.bin\"");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "dirlist name=\"Hdd:\\missing\"");
+        socket_send(socket, "402- file not found\r\n");
+
+        expect_line(socket, "s360");
+        socket_send(socket, "200- SRPC usage\r\n");
+        expect_line(socket, "s360 gamertag");
+        socket_send(socket, "200- TestUser\r\n");
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        require(
+            client.console_id() == "001122334455",
+            "console ID did not preserve leading zeroes");
+        require(
+            client.console_type() == "TestKit",
+            "console type field was not parsed");
+        require(client.is_devkit(), "testkit was not recognized as a devkit console");
+        require(
+            client.dm_version() == "2.0.20353.0",
+            "debug monitor version was not preserved");
+        require(
+            client.drives() == std::vector<std::string>{"Hdd:", "Usb0:"},
+            "drive list fields were not parsed");
+
+        const auto module_lines = client.modules();
+        require(module_lines.size() == 2, "module list did not preserve both rows");
+        require(
+            module_lines[0] == "name=\"xam.xex\" base=0x81600000",
+            "first module row was altered");
+        require(client.process_id() == 0x42, "process ID was not parsed as hexadecimal");
+        require(
+            client.title_path() == "Hdd:\\Games\\default.xex",
+            "current title path was not parsed from xbeinfo");
+
+        const auto entries = client.directory_contents("Hdd:\\Games");
+        require(entries.size() == 2, "directory listing did not return two entries");
+        require(
+            entries[0].name == "default.xex" &&
+                entries[0].size == 0x0000000100000002ULL &&
+                !entries[0].is_directory,
+            "file directory entry fields were not parsed");
+        require(
+            entries[0].created_filetime == 0x0000000300000004ULL &&
+                entries[0].changed_filetime == 0x0000000500000006ULL,
+            "directory FILETIME fields were not combined in high/low order");
+        require(
+            entries[1].name == "Content" && entries[1].is_directory,
+            "directory flag token was not parsed");
+
+        client.create_directory("Hdd:\\New Folder");
+        client.delete_file("Hdd:\\old.bin");
+        client.delete_directory("Hdd:\\Old Folder");
+        client.rename_path("Hdd:\\before.bin", "Hdd:\\after.bin");
+        require(
+            !client.is_directory("Hdd:\\missing"),
+            "XBDM 402 path was not reported as a non-directory");
+        require(client.gamertag() == "TestUser", "gamertag response was not preserved");
+    }
+
+    server.finish();
+}
+
+void file_transfer_test() {
+    const srpc::ByteBuffer upload_data{0xDE, 0xAD, 0xBE, 0xEF};
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "getfile name=\"Hdd:\\data.bin\"");
+        socket_send(socket, "203- binary response follows\r\n");
+        const std::array<std::uint8_t, 9> download_frame{
+            0x05, 0x00, 0x00, 0x00,
+            0x10, 0x20, 0x30, 0x40, 0x50};
+        socket_send(socket, download_frame.data(), download_frame.size());
+
+        expect_line(socket, "sendfile name=\"Hdd:\\upload.bin\" length=0x4");
+        socket_send(socket, "410- file already exists\r\n");
+        expect_line(socket, "delete name=\"Hdd:\\upload.bin\"");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "sendfile name=\"Hdd:\\upload.bin\" length=0x4");
+        socket_send(socket, "204- send binary data\r\n");
+        require(
+            socket_read_exact(socket, upload_data.size()) == upload_data,
+            "uploaded binary body differed from the caller's bytes");
+        socket_send(socket, "200- transfer complete\r\n");
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        require(
+            client.download_file("Hdd:\\data.bin") ==
+                srpc::ByteBuffer{0x10, 0x20, 0x30, 0x40, 0x50},
+            "download did not consume the little-endian size and exact body");
+        client.upload_file("Hdd:\\upload.bin", upload_data, true);
+    }
+
+    server.finish();
+}
+
+void streaming_file_transfer_test() {
+    const srpc::ByteBuffer download_data{
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90};
+    const srpc::ByteBuffer upload_data{
+        0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56};
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "getfile name=\"Hdd:\\stream.bin\"");
+        socket_send(socket, "203- binary response follows\r\n");
+        const std::array<std::uint8_t, 4> size{
+            static_cast<std::uint8_t>(download_data.size()), 0, 0, 0};
+        socket_send(socket, size.data(), size.size());
+        socket_send(socket, download_data.data(), download_data.size());
+
+        expect_line(socket, "sendfile name=\"Hdd:\\upload-stream.bin\" length=0x7");
+        socket_send(socket, "204- send binary data\r\n");
+        require(
+            socket_read_exact(socket, upload_data.size()) == upload_data,
+            "streaming upload body differed from the local file");
+        socket_send(socket, "200- transfer complete\r\n");
+
+        expect_line(socket, "sendfile name=\"Hdd:\\already.bin\" length=0x7");
+        socket_send(socket, "410- file already exists\r\n");
+    });
+
+    TemporaryDirectory temporary;
+    const auto download_path = temporary.path() / "download.bin";
+    const auto upload_path = temporary.path() / "upload.bin";
+    write_local_file(upload_path, upload_data);
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        std::vector<std::uint64_t> download_progress;
+        srpc::FileTransferOptions download_options;
+        download_options.chunk_size = 4;
+        download_options.progress = [&](const srpc::TransferProgress& progress) {
+            require(progress.file_index == 1, "single-file progress index was not one");
+            require(
+                progress.file_count == std::size_t{1},
+                "single-file progress count was not one");
+            if (progress.phase == srpc::TransferPhase::transferring) {
+                download_progress.push_back(progress.file_bytes_transferred);
+            }
+            return srpc::TransferControl::continue_;
+        };
+        const auto downloaded = client.download_file_to(
+            "Hdd:\\stream.bin", download_path, download_options);
+        require(
+            downloaded.files_completed == 1 &&
+                downloaded.bytes_transferred == download_data.size() &&
+                !downloaded.cancelled,
+            "streaming download returned incorrect totals");
+        require(
+            download_progress == std::vector<std::uint64_t>{0, 4, 8, 9},
+            "streaming download progress did not follow chunk boundaries");
+        require(
+            read_local_file(download_path) == download_data,
+            "streaming download did not atomically commit the expected bytes");
+
+        std::vector<std::uint64_t> upload_progress;
+        srpc::FileTransferOptions upload_options;
+        upload_options.chunk_size = 3;
+        upload_options.progress = [&](const srpc::TransferProgress& progress) {
+            if (progress.phase == srpc::TransferPhase::transferring) {
+                upload_progress.push_back(progress.file_bytes_transferred);
+            }
+            return srpc::TransferControl::continue_;
+        };
+        const auto uploaded = client.upload_file_from(
+            upload_path, "Hdd:\\upload-stream.bin", upload_options);
+        require(
+            uploaded.files_completed == 1 &&
+                uploaded.bytes_transferred == upload_data.size(),
+            "streaming upload returned incorrect totals");
+        require(
+            upload_progress == std::vector<std::uint64_t>{0, 3, 6, 7},
+            "streaming upload progress did not follow chunk boundaries");
+
+        upload_options.existing_file = srpc::ExistingFilePolicy::skip;
+        const auto skipped = client.upload_file_from(
+            upload_path, "Hdd:\\already.bin", upload_options);
+        require(
+            skipped.files_skipped == 1 && skipped.files_completed == 0,
+            "streaming upload did not report an existing remote file as skipped");
+    }
+
+    server.finish();
+}
+
+void streaming_download_cancellation_test() {
+    const srpc::ByteBuffer body{1, 2, 3, 4, 5, 6, 7, 8};
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(socket, "getfile name=\"Hdd:\\cancel.bin\"");
+        socket_send(socket, "203- binary response follows\r\n");
+        const std::array<std::uint8_t, 4> size{8, 0, 0, 0};
+        socket_send(socket, size.data(), size.size());
+        socket_send(socket, body.data(), body.size());
+    });
+
+    TemporaryDirectory temporary;
+    const auto destination = temporary.path() / "cancel.bin";
+    bool reentry_blocked = false;
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        srpc::FileTransferOptions options;
+        options.chunk_size = 4;
+        options.progress = [&](const srpc::TransferProgress& progress) {
+            if (progress.file_bytes_transferred == 0) {
+                try {
+                    static_cast<void>(client.send_command("getpid"));
+                } catch (const srpc::ProtocolError&) {
+                    reentry_blocked = true;
+                }
+            }
+            return progress.file_bytes_transferred >= 4
+                ? srpc::TransferControl::cancel
+                : srpc::TransferControl::continue_;
+        };
+
+        const auto result = client.download_file_to(
+            "Hdd:\\cancel.bin", destination, options);
+        require(result.cancelled, "download callback cancellation was not reported");
+        require(!client.connected(), "cancelled binary transfer kept a desynchronized socket");
+    }
+
+    require(reentry_blocked, "progress callback was able to interleave an XBDM command");
+    require(!fs::exists(destination), "cancelled download left a destination file");
+    require(
+        fs::is_empty(temporary.path()),
+        "cancelled download did not remove its temporary partial file");
+    server.finish();
+}
+
+void recursive_directory_transfer_test() {
+    const srpc::ByteBuffer root_data{0x10, 0x20, 0x30};
+    const srpc::ByteBuffer nested_data{0x40, 0x50, 0x60};
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "dirlist name=\"Hdd:\\Tree\"");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "name=\"sub\" sizehi=0 sizelo=0 directory\r\n"
+            "name=\"root.bin\" sizehi=0 sizelo=3\r\n"
+            "name=\"empty\" sizehi=0 sizelo=0 directory\r\n"
+            ".\r\n");
+        expect_line(socket, "dirlist name=\"Hdd:\\Tree\\empty\"");
+        socket_send(socket, "202- multiline response follows\r\n.\r\n");
+        expect_line(socket, "dirlist name=\"Hdd:\\Tree\\sub\"");
+        socket_send(
+            socket,
+            "202- multiline response follows\r\n"
+            "name=\"nested.bin\" sizehi=0 sizelo=3\r\n"
+            ".\r\n");
+
+        expect_line(socket, "getfile name=\"Hdd:\\Tree\\root.bin\"");
+        socket_send(socket, "203- binary response follows\r\n");
+        const std::array<std::uint8_t, 4> root_size{3, 0, 0, 0};
+        socket_send(socket, root_size.data(), root_size.size());
+        socket_send(socket, root_data.data(), root_data.size());
+        expect_line(socket, "getfile name=\"Hdd:\\Tree\\sub\\nested.bin\"");
+        socket_send(socket, "203- binary response follows\r\n");
+        const std::array<std::uint8_t, 4> nested_size{3, 0, 0, 0};
+        socket_send(socket, nested_size.data(), nested_size.size());
+        socket_send(socket, nested_data.data(), nested_data.size());
+
+        expect_line(socket, "mkdir name=\"Hdd:\\Upload\"");
+        socket_send(socket, "410- already exists\r\n");
+        expect_line(socket, "dirlist name=\"Hdd:\\Upload\"");
+        socket_send(socket, "202- multiline response follows\r\n.\r\n");
+        expect_line(socket, "mkdir name=\"Hdd:\\Upload\\empty\"");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "sendfile name=\"Hdd:\\Upload\\root.bin\" length=0x3");
+        socket_send(socket, "204- send binary data\r\n");
+        require(
+            socket_read_exact(socket, root_data.size()) == root_data,
+            "recursive root-file upload body was wrong");
+        socket_send(socket, "200- transfer complete\r\n");
+        expect_line(socket, "mkdir name=\"Hdd:\\Upload\\sub\"");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(
+            socket,
+            "sendfile name=\"Hdd:\\Upload\\sub\\nested.bin\" length=0x3");
+        socket_send(socket, "204- send binary data\r\n");
+        require(
+            socket_read_exact(socket, nested_data.size()) == nested_data,
+            "recursive nested-file upload body was wrong");
+        socket_send(socket, "200- transfer complete\r\n");
+    });
+
+    TemporaryDirectory temporary;
+    const auto download_root = temporary.path() / "download-tree";
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        std::vector<std::uint64_t> completed_totals;
+        srpc::DirectoryTransferOptions download_options;
+        download_options.files.chunk_size = 2;
+        download_options.files.progress = [&](const srpc::TransferProgress& progress) {
+            if (progress.phase == srpc::TransferPhase::file_complete) {
+                require(
+                    progress.file_count == std::size_t{2} &&
+                        progress.overall_bytes_total == std::uint64_t{6},
+                    "recursive download progress totals were not aggregated");
+                completed_totals.push_back(progress.overall_bytes_transferred);
+            }
+            return srpc::TransferControl::continue_;
+        };
+        const auto downloaded = client.download_directory_to(
+            "Hdd:\\Tree", download_root, download_options);
+        require(
+            downloaded.files_completed == 2 &&
+                downloaded.files_skipped == 0 &&
+                downloaded.bytes_transferred == 6 &&
+                !downloaded.cancelled,
+            "recursive download returned incorrect totals");
+        require(
+            completed_totals == std::vector<std::uint64_t>{3, 6},
+            "recursive download overall progress was not monotonic");
+        require(
+            read_local_file(download_root / "root.bin") == root_data &&
+                read_local_file(download_root / "sub" / "nested.bin") == nested_data,
+            "recursive download wrote incorrect file contents");
+        require(
+            fs::is_directory(download_root / "empty"),
+            "recursive download did not preserve an empty directory");
+
+        srpc::DirectoryTransferOptions upload_options;
+        upload_options.files.chunk_size = 2;
+        const auto uploaded = client.upload_directory_from(
+            download_root, "Hdd:\\Upload", upload_options);
+        require(
+            uploaded.files_completed == 2 &&
+                uploaded.files_skipped == 0 &&
+                uploaded.bytes_transferred == 6 &&
+                !uploaded.cancelled,
+            "recursive upload returned incorrect totals");
+    }
+
+    server.finish();
+}
+
+void executable_pool_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(socket, "s360 alloc 5");
+        socket_send(socket, "200- 82030000\r\n");
+        expect_line(socket, "s360 poolinfo");
+        socket_send(socket, "200- used=00000008 free=0000FFF8\r\n");
+        expect_line(socket, "s360 poolreset");
+        socket_send(socket, "200- ok\r\n");
+        expect_line(socket, "s360 alloc 65536");
+        socket_send(socket, "400- pool_full\r\n");
+    });
+
+    {
+        auto options = test_options(server.port(), srpc::Protocol::native_srpc);
+        srpc::Client client("127.0.0.1", options);
+        client.connect();
+
+        bool zero_rejected = false;
+        try {
+            static_cast<void>(client.allocate_executable(0));
+        } catch (const srpc::ProtocolError&) {
+            zero_rejected = true;
+        }
+        require(zero_rejected, "executable pool accepted a zero-byte allocation");
+        require(
+            client.allocate_executable(5) == 0x82030000,
+            "executable allocation address was parsed incorrectly");
+        const auto info = client.executable_pool_info();
+        require(
+            info.used == 8 && info.free == 0xFFF8,
+            "executable pool usage was parsed incorrectly");
+        client.reset_executable_pool(
+            srpc::ExecutablePoolReset::confirm_live_allocations_may_be_overwritten);
+
+        bool full_reported = false;
+        try {
+            static_cast<void>(client.allocate_executable(0x10000));
+        } catch (const srpc::RpcError&) {
+            full_reported = true;
+        }
+        require(full_reported, "plugin pool exhaustion was not surfaced as an RPC error");
+    }
+
+    server.finish();
+}
+
+void jrpc_convenience_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=13 system as=0 "
+            "params=\"A\\0\\A\\0\\\"");
+        socket_send(socket, "200- 17559\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=10 system as=0 "
+            "params=\"A\\0\\A\\0\\\"");
+        socket_send(socket, "200- 00112233445566778899aabbccddeeff\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=9 system as=0 "
+            "params=\"A\\0\\A\\2\\2/7\\78616D2E786578\\1\\528\\\"");
+        socket_send(socket, "200- 81812340\r\n");
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=1 system as=0 "
+            "params=\"A\\81812340\\A\\1\\1\\2\\\"");
+        socket_send(socket, "200- 2\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=18 system as=0 "
+            "params=\"A\\82000000\\A\\5\\"
+            "1\\7\\1\\1\\1\\8\\1\\1\\1\\9\\\"");
+        socket_send(socket, "200- ok\r\n");
+
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=12 system as=0 "
+            "params=\"A\\0\\A\\2\\2/5\\5265616479\\1\\77\\\"");
+        socket_send(socket, "200- S_OK\r\n");
+    });
+
+    {
+        auto options = test_options(server.port(), srpc::Protocol::jrpc2);
+        srpc::Client client("127.0.0.1", options);
+        client.connect();
+        require(client.plugin_available(), "pinned JRPC2 plugin probe failed");
+        require(
+            client.cpu_key() == "00112233445566778899AABBCCDDEEFF",
+            "CPU key was not validated and normalized to uppercase");
+        require(
+            client.sign_in_state(2) == srpc::SignInState::signed_in_to_xbox_live,
+            "XamUserGetSigninState result was not mapped to SignInState");
+        client.constant_memory_set(0x82000000, 7, 8, 9);
+        client.notify("Ready", srpc::NotificationType::smartglass_available);
+    }
+
+    server.finish();
+}
+
+void jrpc_shutdown_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(
+            socket,
+            "consolefeatures ver=2 type=11 system as=0 "
+            "params=\"A\\0\\A\\0\\\"");
+        // The console powers down before JRPC2 can send a response.
+    });
+
+    {
+        auto options = test_options(server.port(), srpc::Protocol::jrpc2);
+        srpc::Client client("127.0.0.1", options);
+        client.connect();
+        client.shutdown();
+        require(!client.connected(), "shutdown did not close the local connection");
+    }
+
+    server.finish();
+}
+
+void native_management_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "go");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(socket, "stop");
+        socket_send(socket, "200- OK\r\n");
+
+        expect_line(socket, "s360 loadmod Hdd:\\Plugins\\helper.xex");
+        socket_send(socket, "200- ok handle=82020000\r\n");
+        expect_line(socket, "s360 settime 019DB1DE D53E8000");
+        socket_send(socket, "200- ok\r\n");
+
+        expect_line(socket, "s360 resolve str:78616D2E786578 1102");
+        socket_send(socket, "200- 81800000\r\n");
+        expect_line(socket, "s360 81800000 str:746573742E786578");
+        socket_send(socket, "200- 82010000\r\n");
+
+        expect_line(socket, "s360 resolve str:78616D2E786578 1102");
+        socket_send(socket, "200- 81800000\r\n");
+        expect_line(socket, "s360 81800000 str:746573742E786578");
+        socket_send(socket, "200- 82010000\r\n");
+        expect_line(socket, "setmem addr=0x82010040 data=0001");
+        socket_send(socket, "200- OK\r\n");
+        expect_line(
+            socket,
+            "s360 resolve str:78626F786B726E6C2E657865 417");
+        socket_send(socket, "200- 81800010\r\n");
+        expect_line(socket, "s360 81800010 2181103616");
+        socket_send(socket, "200- 00000000\r\n");
+    });
+
+    {
+        auto options = test_options(server.port(), srpc::Protocol::native_srpc);
+        srpc::Client client("127.0.0.1", options);
+        client.connect();
+        client.debug_go();
+        client.debug_stop();
+        require(
+            client.load_module("Hdd:\\Plugins\\helper.xex") ==
+                "ok handle=82020000",
+            "native module-load response was not preserved");
+        client.set_system_time(std::chrono::system_clock::time_point{});
+        require(
+            client.module_handle("test.xex") == 0x82010000,
+            "native module handle lookup returned the wrong address");
+        client.unload_module("test.xex");
+    }
+
+    server.finish();
+}
+
+void reboot_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(socket, "magicboot cold");
+        // Reboot intentionally has no reply.
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        client.reboot();
+        require(!client.connected(), "reboot did not close the local connection");
+    }
+
+    server.finish();
+}
+
+void launch_xex_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(
+            socket,
+            "magicboot title=\"Hdd:\\Games\\default.xex\" "
+            "directory=\"Hdd:\\Games\"");
+        // A title switch intentionally has no reply.
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        client.launch_xex("Hdd:\\Games\\default.xex", "Hdd:\\Games");
+        require(!client.connected(), "launch_xex did not close the local connection");
+    }
+
+    server.finish();
+}
+
+void screenshot_capture_test() {
+    const srpc::ByteBuffer tiny_framebuffer{0x0D, 0x0A, 0x2E, 0x00};
+    srpc::ByteBuffer tiled_framebuffer(0x1000);
+    tiled_framebuffer[0xFFC] = 0x11;
+    tiled_framebuffer[0xFFD] = 0x22;
+    tiled_framebuffer[0xFFE] = 0x33;
+    tiled_framebuffer[0xFFF] = 0x44;
+
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        expect_line(socket, "screenshot");
+        socket_send(socket, "203- binary response follows\r\n");
+        socket_send(
+            socket,
+            "height=0x1 pitch=0x4 unknown=0x99 width=0x1 "
+            "offsetx=0x0 offsety=0x0, framebuffersize=0x4 "
+            "sw=0x1 sh=0x1 format=0x18280186 colorspace=0x0\r\n");
+        socket_send(socket, tiny_framebuffer.data(), tiny_framebuffer.size());
+
+        expect_line(socket, "screenshot");
+        socket_send(socket, "203- binary response follows\r\n");
+        socket_send(
+            socket,
+            "pitch=0x80 width=0x20 height=0x20 "
+            "framebuffersize=0x1000\r\n");
+        socket_send(
+            socket, tiled_framebuffer.data(), tiled_framebuffer.size());
+
+        expect_line(socket, "getpid");
+        socket_send(socket, "200- pid=0x42\r\n");
+    });
+
+    {
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+
+        const auto raw = client.capture_raw_screenshot();
+        require(raw.metadata.pitch_bytes == 4, "screenshot pitch was not parsed");
+        require(raw.metadata.width == 1, "screenshot width was not parsed");
+        require(raw.metadata.height == 1, "screenshot height was not parsed");
+        require(
+            raw.metadata.display_width == 1 &&
+                raw.metadata.display_height == 1,
+            "screenshot display dimensions were not parsed");
+        require(
+            raw.metadata.format == std::optional<std::uint32_t>{0x18280186},
+            "screenshot format was not preserved");
+        require(
+            raw.metadata.color_space == std::optional<std::uint32_t>{0},
+            "screenshot color space was not preserved");
+        require(
+            raw.tiled_framebuffer == tiny_framebuffer,
+            "binary screenshot bytes were interpreted as lines");
+
+        const auto image = client.capture_screenshot();
+        require(
+            image.width == 32 && image.height == 32 &&
+                image.bgra.size() == 0x1000,
+            "decoded screenshot dimensions are wrong");
+        constexpr std::size_t golden_pixel = 0xFBC;
+        require(
+            image.bgra[golden_pixel] == 0x11 &&
+                image.bgra[golden_pixel + 1] == 0x22 &&
+                image.bgra[golden_pixel + 2] == 0x33 &&
+                image.bgra[golden_pixel + 3] == 0xFF,
+            "captured screenshot did not use the Xenos tiled layout");
+
+        require(
+            client.send_command("getpid").message == "pid=0x42",
+            "screenshot body left the XBDM stream desynchronized");
+    }
+    server.finish();
+}
+
+void screenshot_failure_test() {
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "203- binary response follows\r\n");
+            socket_send(
+                socket,
+                "pitch=0x80 width=0x20 height=0x20 "
+                "framebuffersize=0x1000\r\n");
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool limit_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot(16));
+        } catch (const srpc::ProtocolError&) {
+            limit_rejected = true;
+        }
+        require(limit_rejected, "oversized screenshot body was accepted");
+        require(
+            !client.connected(),
+            "rejected binary screenshot left a desynchronized connection open");
+        server.finish();
+    }
+
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "203- binary response follows\r\n");
+            socket_send(
+                socket,
+                "pitch=0x80 width=0x20 width=0x20 height=0x20 "
+                "framebuffersize=0x1000\r\n");
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool duplicate_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot());
+        } catch (const srpc::ProtocolError&) {
+            duplicate_rejected = true;
+        }
+        require(duplicate_rejected, "duplicate screenshot metadata was accepted");
+        require(
+            !client.connected(),
+            "malformed binary screenshot left its connection open");
+        server.finish();
+    }
+
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "203- binary response follows\r\n");
+            socket_send(
+                socket,
+                "pitch=0x4 width=0x1 height=0x1 framebuffersize=0x4\r\n");
+            constexpr std::array<std::uint8_t, 2> partial{0xAA, 0xBB};
+            socket_send(socket, partial.data(), partial.size());
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool truncation_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot());
+        } catch (const srpc::Error&) {
+            truncation_rejected = true;
+        }
+        require(truncation_rejected, "truncated screenshot body was accepted");
+        require(
+            !client.connected(),
+            "truncated binary screenshot left its connection open");
+        server.finish();
+    }
+
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "200- screenshot unavailable\r\n");
+            expect_line(socket, "getpid");
+            socket_send(socket, "200- pid=0x43\r\n");
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool status_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot());
+        } catch (const srpc::ProtocolError&) {
+            status_rejected = true;
+        }
+        require(status_rejected, "non-203 screenshot status was accepted");
+        require(
+            client.connected(),
+            "non-binary screenshot failure unnecessarily closed the connection");
+        require(
+            client.send_command("getpid").message == "pid=0x43",
+            "non-binary screenshot failure desynchronized the connection");
+        server.finish();
+    }
+
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "202- multiline response follows\r\n");
+            socket_send(socket, "screenshot is unavailable\r\n.\r\n");
+            expect_line(socket, "getpid");
+            socket_send(socket, "200- pid=0x44\r\n");
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool status_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot());
+        } catch (const srpc::ProtocolError&) {
+            status_rejected = true;
+        }
+        require(status_rejected, "multiline screenshot status was accepted");
+        require(
+            client.send_command("getpid").message == "pid=0x44",
+            "multiline screenshot failure was not drained completely");
+        server.finish();
+    }
+
+    {
+        ScriptedServer server([](SOCKET socket) {
+            socket_send(socket, "201- connected\r\n");
+            expect_line(socket, "screenshot");
+            socket_send(socket, "204- send binary data\r\n");
+        });
+
+        srpc::Client client("127.0.0.1", test_options(server.port()));
+        client.connect();
+        bool status_rejected = false;
+        try {
+            static_cast<void>(client.capture_raw_screenshot());
+        } catch (const srpc::ProtocolError&) {
+            status_rejected = true;
+        }
+        require(status_rejected, "upload-state screenshot status was accepted");
+        require(
+            !client.connected(),
+            "upload-state screenshot response left its connection open");
+        server.finish();
+    }
+}
+
+void discovery_probe_test() {
+    ScriptedServer server([](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+        expect_line(socket, "dbgname");
+        socket_send(socket, "200- Development Kit\r\n");
+    });
+
+    srpc::DiscoveryOptions options;
+    options.port = server.port();
+    options.connect_timeout = std::chrono::milliseconds(1000);
+    options.io_timeout = std::chrono::milliseconds(1000);
+
+    const auto console = srpc::probe_console("127.0.0.1", options);
+    require(console.has_value(), "direct console probe did not find XBDM");
+    require(console->host == "127.0.0.1", "direct console probe changed the host");
+    require(console->name == "Development Kit", "direct console probe missed dbgname");
+    require(console->port == server.port(), "direct console probe changed the port");
+    server.finish();
+}
+
+} // namespace
+
+// The framing itself, which is what read_memory used to get wrong.
+//
+// A single-block reply hid the bug: reading `size` bytes flat off a 4-byte
+// response consumed the two header bytes plus two bytes of payload and looked
+// almost right. It only becomes unmissable across several blocks, and when the
+// console stops early on unmapped memory.
+void getmemex_framing_test() {
+    srpc::ByteBuffer payload(0x900);
+    for (std::size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<std::uint8_t>(index * 7 + 1);
+    }
+
+    ScriptedServer server([&](SOCKET socket) {
+        socket_send(socket, "201- connected\r\n");
+
+        // Three blocks: 0x400, 0x400, then 0x100 carrying the end flag.
+        expect_line(socket, "getmemex addr=0x82000000 length=2304");
+        socket_send_binary_response(socket, payload);
+
+        // A read that runs into unmapped memory: one readable block, then a
+        // zero-length block with the end flag. The reply is complete, so the
+        // connection stays usable and the next command still works.
+        expect_line(socket, "getmemex addr=0x83000000 length=2048");
+        const auto truncated = frame_getmemex_hole(
+            std::span<const std::uint8_t>(payload).first(0x400));
+        socket_send(socket, "203- binary response follows\r\n");
+        socket_send(socket, truncated.data(), truncated.size());
+
+        expect_line(socket, "getpid");
+        socket_send(socket, "200- pid=0x42\r\n");
+    });
+
+    srpc::Client client("127.0.0.1", test_options(server.port()));
+    client.connect();
+
+    const auto whole = client.read_memory(0x82000000, payload.size());
+    require(whole.size() == payload.size(), "multi-block read returned the wrong size");
+    require(whole == payload, "multi-block read returned the wrong bytes");
+
+    bool threw = false;
+    try {
+        static_cast<void>(client.read_memory(0x83000000, 0x800));
+    } catch (const srpc::ProtocolError& error) {
+        threw = true;
+        const std::string text = error.what();
+        require(
+            text.find("83000400") != std::string::npos,
+            "a truncated read should name the address it stopped at");
+    }
+    require(threw, "a truncated getmemex reply should be reported, not returned short");
+
+    // The decisive part: the connection is still in step afterwards.
+    require(client.process_id() == 0x42, "the connection desynchronised after a short read");
+}
+
+int main() {
+    try {
+        discovery_probe_test();
+        integration_test();
+        getmemex_framing_test();
+        memory_helpers_test();
+        pointer_chain_test();
+        sparse_memory_read_test();
+        xbdm_metadata_and_filesystem_test();
+        file_transfer_test();
+        streaming_file_transfer_test();
+        streaming_download_cancellation_test();
+        recursive_directory_transfer_test();
+        executable_pool_test();
+        jrpc_convenience_test();
+        jrpc_shutdown_test();
+        native_management_test();
+        reboot_test();
+        launch_xex_test();
+        screenshot_capture_test();
+        screenshot_failure_test();
+        std::cout << "All SRPC integration tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "FAILED: " << error.what() << '\n';
+        return 1;
+    }
+}
